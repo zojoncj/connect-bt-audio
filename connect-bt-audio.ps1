@@ -51,11 +51,15 @@ function Ensure-AudioDeviceCmdlets {
 $script:BtExePath = Join-Path $PSScriptRoot 'btconnect.exe'
 
 function Build-BluetoothHelper {
-    if (Test-Path $script:BtExePath) { return }
+    if ((Test-Path $script:BtExePath) -and
+        (Get-Item $script:BtExePath).LastWriteTime -ge (Get-Item $PSCommandPath).LastWriteTime) {
+        return
+    }
 
     $csFile = [IO.Path]::GetTempFileName()
     Set-Content -Path $csFile -Value @'
 using System;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.Rfcomm;
@@ -64,6 +68,51 @@ using Windows.Foundation;
 using Windows.Networking.Sockets;
 
 class Program {
+    [StructLayout(LayoutKind.Sequential)]
+    struct BLUETOOTH_FIND_RADIO_PARAMS { public uint dwSize; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SYSTEMTIME {
+        public ushort wYear, wMonth, wDayOfWeek, wDay;
+        public ushort wHour, wMinute, wSecond, wMilliseconds;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct BLUETOOTH_DEVICE_INFO {
+        public uint dwSize;
+        public ulong Address;
+        public uint ulClassofDevice;
+        [MarshalAs(UnmanagedType.Bool)] public bool fConnected;
+        [MarshalAs(UnmanagedType.Bool)] public bool fRemembered;
+        [MarshalAs(UnmanagedType.Bool)] public bool fAuthenticated;
+        public SYSTEMTIME stLastSeen;
+        public SYSTEMTIME stLastUsed;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 248)]
+        public string szName;
+    }
+
+    [DllImport("BluetoothAPIs.dll", SetLastError = true)]
+    static extern IntPtr BluetoothFindFirstRadio(
+        ref BLUETOOTH_FIND_RADIO_PARAMS pbtfrp, out IntPtr phRadio);
+
+    [DllImport("BluetoothAPIs.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool BluetoothFindRadioClose(IntPtr hFind);
+
+    [DllImport("BluetoothAPIs.dll", SetLastError = true)]
+    static extern uint BluetoothSetServiceState(
+        IntPtr hRadio, ref BLUETOOTH_DEVICE_INFO pbtdi,
+        ref Guid pGuidService, uint dwServiceFlags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    static readonly Guid A2DP_SINK_UUID =
+        new Guid("0000110b-0000-1000-8000-00805f9b34fb");
+    const uint BLUETOOTH_SERVICE_DISABLE = 0x00;
+    const uint BLUETOOTH_SERVICE_ENABLE  = 0x01;
+
     static T AwaitOp<T>(IAsyncOperation<T> op) {
         int ms = 0;
         while (op.Status == AsyncStatus.Started) {
@@ -92,6 +141,50 @@ class Program {
         }
     }
 
+    static bool CycleBluetoothService(ulong bluetoothAddress) {
+        var radioParams = new BLUETOOTH_FIND_RADIO_PARAMS();
+        radioParams.dwSize = (uint)Marshal.SizeOf(typeof(BLUETOOTH_FIND_RADIO_PARAMS));
+
+        IntPtr hRadio;
+        IntPtr hFind = BluetoothFindFirstRadio(ref radioParams, out hRadio);
+        if (hFind == IntPtr.Zero) {
+            Console.Error.WriteLine("RADIO_NOT_FOUND");
+            return false;
+        }
+        BluetoothFindRadioClose(hFind);
+
+        var btdi = new BLUETOOTH_DEVICE_INFO();
+        btdi.dwSize = (uint)Marshal.SizeOf(typeof(BLUETOOTH_DEVICE_INFO));
+        btdi.Address = bluetoothAddress;
+
+        Console.WriteLine("CYCLING_SERVICE");
+
+        Guid svc = A2DP_SINK_UUID;
+        uint result = BluetoothSetServiceState(
+            hRadio, ref btdi, ref svc, BLUETOOTH_SERVICE_DISABLE);
+        if (result != 0) {
+            Console.Error.WriteLine("DISABLE_FAILED\t" + result);
+            CloseHandle(hRadio);
+            return false;
+        }
+        Console.WriteLine("SERVICE_DISABLED");
+
+        Thread.Sleep(3000);
+
+        result = BluetoothSetServiceState(
+            hRadio, ref btdi, ref svc, BLUETOOTH_SERVICE_ENABLE);
+        if (result != 0) {
+            Console.Error.WriteLine("ENABLE_FAILED\t" + result);
+            CloseHandle(hRadio);
+            return false;
+        }
+        Console.WriteLine("SERVICE_ENABLED");
+
+        CloseHandle(hRadio);
+        Thread.Sleep(2000);
+        return true;
+    }
+
     static void Main(string[] args) {
         string mode   = args.Length > 0 ? args[0] : "list";
         string filter = args.Length > 1 ? args[1] : "";
@@ -105,7 +198,7 @@ class Program {
             return;
         }
 
-        if (mode == "connect") {
+        if (mode == "connect" || mode == "reconnect") {
             DeviceInformation target = null;
             foreach (var d in devices) {
                 if (filter.Length == 0 ||
@@ -126,6 +219,12 @@ class Program {
                 Environment.Exit(1);
             }
 
+            if (mode == "reconnect") {
+                if (!CycleBluetoothService(btDevice.BluetoothAddress)) {
+                    Console.Error.WriteLine("CYCLE_FAILED");
+                }
+            }
+
             var svcResult = AwaitOp(
                 btDevice.GetRfcommServicesAsync(BluetoothCacheMode.Uncached));
 
@@ -138,9 +237,6 @@ class Program {
                 Environment.Exit(1);
             }
 
-            // Open a persistent StreamSocket to the first RFCOMM service.
-            // This creates a real Bluetooth data channel that keeps the ACL
-            // radio link alive, giving Windows time to negotiate A2DP/HFP.
             var service = svcResult.Services[0];
             Console.WriteLine("CONNECTING\t" + service.ServiceId.Uuid);
 
@@ -155,7 +251,6 @@ class Program {
                 Console.WriteLine("SOCKET_FAIL\t" + ex.Message);
             }
 
-            // Hold connection alive (PowerShell kills us when audio is ready)
             Console.WriteLine("HOLDING");
             Console.Out.Flush();
             Thread.Sleep(90000);
@@ -230,37 +325,49 @@ function Connect-AndWaitForAudio {
     param(
         [string]$SearchTerm,
         [string]$AudioPattern,
+        [string]$Mode = "connect",
         [int]$RetryCount,
         [int]$RetryDelaySeconds
     )
 
     $totalSecs = $RetryCount * $RetryDelaySeconds
     Write-Host ""
-    Write-Host "[*] Opening persistent Bluetooth connection (up to ${totalSecs}s)..."
-    Write-Host "    Tip: If your device connected to another device (e.g. phone), disconnect it there."
+    if ($Mode -eq 'reconnect') {
+        Write-Host "[*] Cycling Bluetooth audio service to force a fresh connection..."
+    } else {
+        Write-Host "[*] Opening persistent Bluetooth connection (up to ${totalSecs}s)..."
+        Write-Host "    Tip: If your device connected to another device (e.g. phone), disconnect it there."
+    }
     Write-Host ""
 
     $outFile = Join-Path ([IO.Path]::GetTempPath()) 'btconnect_out.txt'
     $errFile = Join-Path ([IO.Path]::GetTempPath()) 'btconnect_err.txt'
 
     $bgProc = Start-Process -FilePath $script:BtExePath `
-        -ArgumentList "connect", $SearchTerm `
+        -ArgumentList $Mode, $SearchTerm `
         -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $outFile `
         -RedirectStandardError  $errFile
 
-    Start-Sleep -Seconds 5
+    $initialWait = if ($Mode -eq 'reconnect') { 12 } else { 5 }
+    Start-Sleep -Seconds $initialWait
 
     if ($bgProc.HasExited) {
         $err = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "unknown" }
         $out = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
+        if ($Mode -eq 'reconnect' -and $err -match 'DISABLE_FAILED|CYCLE_FAILED') {
+            throw "Could not cycle Bluetooth service (may need admin).`nTry disconnecting manually in Settings > Bluetooth, then run this script again.`nstderr: $err"
+        }
         throw "btconnect.exe exited early:`nstdout: $out`nstderr: $err"
     }
 
     if (Test-Path $outFile) {
         $btOutput = Get-Content $outFile -ErrorAction SilentlyContinue
         foreach ($line in $btOutput) {
-            if ("$line" -match '^FOUND')            { Write-Host "[+] Device located." }
+            if ("$line" -match '^FOUND')             { Write-Host "[+] Device located." }
+            if ("$line" -match '^CYCLING_SERVICE')   { Write-Host "[*] Disabling A2DP service..." }
+            if ("$line" -match '^SERVICE_DISABLED')  { Write-Host "[+] A2DP service disabled." }
+            if ("$line" -match '^SERVICE_ENABLED')   { Write-Host "[+] A2DP service re-enabled." }
             if ("$line" -match '^RFCOMM')            { Write-Host "[+] RFCOMM services queried." }
             if ("$line" -match '^SOCKET_CONNECTED')  { Write-Host "[+] Persistent Bluetooth socket connected!" }
             if ("$line" -match '^SOCKET_FAIL')       { Write-Warning "Socket failed: $line (still holding link)" }
@@ -268,15 +375,43 @@ function Connect-AndWaitForAudio {
         }
     }
 
+    if ($Mode -eq 'reconnect') {
+        $errContent = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
+        if ($errContent -match 'DISABLE_FAILED|CYCLE_FAILED') {
+            if (-not $bgProc.HasExited) {
+                Stop-Process -Id $bgProc.Id -Force -ErrorAction SilentlyContinue
+            }
+            throw "Could not cycle Bluetooth service (may need admin).`nTry disconnecting manually in Settings > Bluetooth, then run this script again."
+        }
+    }
+
     try {
+        # In reconnect mode, wait for the stale endpoint to disappear first
+        if ($Mode -eq 'reconnect') {
+            for ($w = 1; $w -le 5; $w++) {
+                $stale = Get-AudioDevice -List | Where-Object {
+                    $_.Type -eq 'Playback' -and $_.Name -like $AudioPattern -and
+                    $_.Name -notlike "*Headset*" -and $_.Name -notlike "*Find My*"
+                }
+                if ($null -eq $stale) {
+                    Write-Host "[+] Stale audio endpoint removed. Waiting for fresh connection..."
+                    break
+                }
+                if ($w -eq 5) {
+                    Write-Warning "Stale endpoint persisted - polling for a fresh one anyway."
+                }
+                Start-Sleep -Seconds 2
+            }
+        }
+
         for ($i = 1; $i -le $RetryCount; $i++) {
             Write-Host "[*] Checking for audio endpoint ($i of $RetryCount)..."
 
             $playback = Get-AudioDevice -List | Where-Object { $_.Type -eq 'Playback' }
             $candidates = @($playback | Where-Object { $_.Name -like $AudioPattern })
-            $match = ($candidates | Where-Object { $_.Name -notlike "*Headset*" } |
-                      Select-Object -First 1)
-            if ($null -eq $match -and $candidates.Count -gt 0) { $match = $candidates[0] }
+            $match = ($candidates | Where-Object {
+                $_.Name -notlike "*Headset*" -and $_.Name -notlike "*Find My*"
+            } | Select-Object -First 1)
 
             if ($null -ne $match) {
                 Write-Host "[+] Audio endpoint found: '$($match.Name)'"
@@ -310,12 +445,10 @@ function Set-DefaultAudioOutput {
 
     Write-Host "[*] Setting '$($AudioDevice.Name)' as default playback device..."
     Set-AudioDevice -Index $AudioDevice.Index | Out-Null
-    Write-Host "[*] Setting '$($AudioDevice.Name)' as default communication device..."
-    Set-AudioDevice -Index $AudioDevice.Index -CommunicationOnly | Out-Null
 
     $default = Get-AudioDevice -Playback
     if ($default.ID -eq $AudioDevice.ID) {
-        Write-Host "[+] SUCCESS: '$($AudioDevice.Name)' is now the default audio output."
+        Write-Host "[+] SUCCESS: '$($AudioDevice.Name)' is now the default audio output (A2DP stereo)."
     } else {
         Write-Warning "Default playback is still '$($default.Name)' - you may need to switch manually."
     }
@@ -353,24 +486,35 @@ try {
     $namePattern = "*$DeviceName*"
     $device = Find-PairedBluetoothDevice -NamePattern $namePattern
 
+    # Detect stale connection: audio endpoint exists but audio may not be flowing
+    $mode = "connect"
+    $playback = Get-AudioDevice -List | Where-Object { $_.Type -eq 'Playback' }
+    $staleEndpoint = $playback | Where-Object {
+        $_.Name -like $namePattern -and
+        $_.Name -notlike "*Headset*" -and
+        $_.Name -notlike "*Find My*"
+    } | Select-Object -First 1
+
+    if ($null -ne $staleEndpoint) {
+        Write-Host ""
+        Write-Host "[!] '$($staleEndpoint.Name)' is already connected but audio may be stale."
+        Write-Host "    Forcing a reconnect to re-establish the audio stream..."
+        $mode = "reconnect"
+    }
+
     $result = Connect-AndWaitForAudio `
         -SearchTerm $DeviceName `
         -AudioPattern $namePattern `
+        -Mode $mode `
         -RetryCount $RetryCount `
         -RetryDelaySeconds $RetryDelaySeconds
 
     Set-DefaultAudioOutput -AudioDevice $result.AudioDevice
 
-    # Give A2DP time to fully establish the audio stream before
-    # releasing the RFCOMM socket (A2DP uses L2CAP separately)
-    Write-Host "[*] Stabilizing audio connection..."
-    Start-Sleep -Seconds 5
-
-    # Release the RFCOMM channel so the Windows audio driver can use it
-    if (-not $result.BgProcess.HasExited) {
-        Stop-Process -Id $result.BgProcess.Id -Force -ErrorAction SilentlyContinue
-    }
-    Write-Host "[+] Bluetooth helper released."
+    # Let btconnect.exe keep the RFCOMM socket alive in the background.
+    # It will exit on its own after 90s. This ensures the Bluetooth link
+    # stays up while A2DP fully stabilizes (sometimes takes 10-15s).
+    Write-Host "[+] Bluetooth helper running in background (exits automatically)."
 
     Write-Host ""
     Write-Host "=== Done ==="
